@@ -1,0 +1,9 @@
+# Build artifacts and local noise
+node_modules/
+*.log
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/

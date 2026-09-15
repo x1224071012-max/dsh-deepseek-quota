@@ -1,0 +1,6 @@
+# Normalize line endings for everyone.
+#
+# Repository stores LF; every platform checks out LF. Without this, a Windows
+# checkout rewrites every LF as CRLF, and one small edit can show up as a
+# whole-file change the moment anyone on macOS or Linux touches the same file.
+* text=auto eol=lf

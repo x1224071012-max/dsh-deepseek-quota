@@ -1,0 +1,10 @@
+# dsh-deepseek-quota bundle patch.
+#
+# A profile bundle patch layer: DSH applies it after the base bundles, and the
+# `insert` row adds this plugin to the composition. `dsh plugin --profile web
+# add <this-package>` writes the dependency and appends the bundle to
+# `dsh.profile.bundles` automatically, so this file is the whole composition
+# contribution.
+- insert:
+    - id: deepseek-quota
+      name: '@dsh-external/dsh-deepseek-quota'
