@@ -25,23 +25,44 @@ const mod = await import(new URL('../lib/index.js', import.meta.url).href)
 const REAL_FETCH = globalThis.fetch.bind(globalThis)
 
 let failures = 0
+/** Promises from async checks, awaited before the summary so ordering is honest. */
+const pending = []
+
 function check(label, fn) {
+  let outcome
   try {
-    fn()
-    console.log(`  ok   ${label}`)
+    outcome = fn()
   } catch (error) {
     failures += 1
     console.log(`  FAIL ${label}\n       ${error.message}`)
+    return
   }
+
+  if (outcome !== null && outcome !== undefined && typeof outcome.then === 'function') {
+    pending.push(
+      outcome.then(
+        () => console.log(`  ok   ${label}`),
+        (error) => {
+          failures += 1
+          console.log(`  FAIL ${label}\n       ${error.message}`)
+        },
+      ),
+    )
+    return
+  }
+
+  console.log(`  ok   ${label}`)
 }
 
 /** A minimal Cordis context exposing only what the host half reads. */
-function makeCtx({ sessions = [], logs = {}, credentials = {} }) {
+function makeCtx({ sessions = [], logs = {}, credentials = {}, liveEvents = {} }) {
   const routes = []
   const effects = []
+  const readCalls = []
   return {
     routes,
     effects,
+    readCalls,
     get(serviceName) {
       if (serviceName === 'credentials') {
         return {
@@ -57,8 +78,19 @@ function makeCtx({ sessions = [], logs = {}, credentials = {} }) {
             return sessions
           },
           async readSession(id) {
+            readCalls.push(String(id))
             if (logs[id] === undefined) throw new Error('no such session')
             return logs[id]
+          },
+        }
+      }
+      if (serviceName === 'sessions') {
+        return {
+          /** A live session hands back its in-memory log; anything else reads as absent. */
+          get(id) {
+            const events = liveEvents[String(id)]
+            if (events === undefined) return undefined
+            return { ownEvents: () => events }
           },
         }
       }
@@ -103,18 +135,23 @@ function invoke(route, { url = mod.ROUTE, method = 'GET', headers = {} } = {}) {
   })
 }
 
+/** Counts upstream balance calls, so the host cache is observable. */
+let fetchCalls = 0
 /** Replace global fetch with a canned balance response. */
 function stubFetch(total, { available = true, status = 200 } = {}) {
-  globalThis.fetch = async () => ({
-    ok: status >= 200 && status < 300,
-    status,
-    async text() {
-      return JSON.stringify({
-        is_available: available,
-        balance_infos: [{ currency: 'CNY', total_balance: total, granted_balance: '0.00', topped_up_balance: total }],
-      })
-    },
-  })
+  globalThis.fetch = async () => {
+    fetchCalls += 1
+    return {
+      ok: status >= 200 && status < 300,
+      status,
+      async text() {
+        return JSON.stringify({
+          is_available: available,
+          balance_infos: [{ currency: 'CNY', total_balance: total, granted_balance: '0.00', topped_up_balance: total }],
+        })
+      },
+    }
+  }
 }
 
 function localDayKey(ms) {
@@ -165,16 +202,21 @@ const sessions = [
   { live: false, header: { id: 's-pro', createdAt: now - 8_000_000 } },
   { live: false, header: { id: 's-old', createdAt: now - 90 * 86_400_000 } },
 ]
+/**
+ * The live session's log is served from memory, exactly as the plugin reads it
+ * in production; the other two stay on the persistence path, so one fixture
+ * exercises both branches.
+ */
+const liveEvents = {
+  's-live': [
+    { type: 'assistant/message', time: times.flashA, data: { message: { source: FLASH }, usage: usageFlashA } },
+    { type: 'assistant/message', time: times.flashB, data: { message: { source: FLASH }, usage: usageFlashB } },
+    { type: 'user/message', time: now - 3000, data: {} },
+    { type: 'assistant/message', time: now - 4000, data: { message: { source: FLASH }, interrupted: true } },
+  ],
+}
+
 const logs = {
-  's-live': {
-    inheritedEventCount: 0,
-    events: [
-      { type: 'assistant/message', time: times.flashA, data: { message: { source: FLASH }, usage: usageFlashA } },
-      { type: 'assistant/message', time: times.flashB, data: { message: { source: FLASH }, usage: usageFlashB } },
-      { type: 'user/message', time: now - 3000, data: {} },
-      { type: 'assistant/message', time: now - 4000, data: { message: { source: FLASH }, interrupted: true } },
-    ],
-  },
   's-fork': {
     // The inherited prefix must NOT be counted: a fork shares its parent's history.
     inheritedEventCount: 1,
@@ -191,7 +233,7 @@ const logs = {
   },
 }
 
-const ctx = makeCtx({ sessions, logs, credentials: { DEEPSEEK_API_KEY: 'sk-test-key' } })
+const ctx = makeCtx({ sessions, logs, liveEvents, credentials: { DEEPSEEK_API_KEY: 'sk-test-key' } })
 mod.apply(ctx)
 
 console.log('\n[2] route registration')
@@ -274,13 +316,15 @@ check('a session older than the window is not scanned', () => {
 
 console.log('\n[6] spend delta')
 stubFetch('9.01')
-const second = await invoke(ctx.routes[0])
+// `fresh=1` because the host now caches the balance: without it this would
+// reuse the value fetched in section [4] and never see the new stub.
+const second = await invoke(ctx.routes[0], { url: `${mod.ROUTE}?fresh=1` })
 check('spend is baseline minus current', () => {
   assert.equal(second.json.spend.amount, '0.25')
   assert.equal(second.json.spend.baselineTotal, '9.26')
 })
 stubFetch('10.00')
-const toppedUp = await invoke(ctx.routes[0])
+const toppedUp = await invoke(ctx.routes[0], { url: `${mod.ROUTE}?fresh=1` })
 check('a top-up re-anchors instead of going negative', () => {
   assert.equal(toppedUp.json.spend.amount, '0.00')
   assert.equal(toppedUp.json.spend.rebalanced, true)
@@ -288,7 +332,7 @@ check('a top-up re-anchors instead of going negative', () => {
 })
 
 console.log('\n[7] scope=balance skips the log scan')
-const balanceOnly = await invoke(ctx.routes[0], { url: `${mod.ROUTE}?scope=balance` })
+const balanceOnly = await invoke(ctx.routes[0], { url: `${mod.ROUTE}?scope=balance&fresh=1` })
 check('usage omitted, balance and spend present', () => {
   assert.equal(balanceOnly.json.ok, true)
   assert.equal(balanceOnly.json.usage, undefined)
@@ -459,6 +503,59 @@ check('tokens counted, cost zero, unpriced flagged, model still named', () => {
   assert.equal(day.models[0].pricedRequests, 0)
 })
 
+/* ================= performance: memory reads and caching ================= */
+
+console.log('\n[14] live sessions are read from memory, persisted ones from disk')
+check('the live session never went back through persistence', () => {
+  assert.equal(first.json.usage.readFromMemory, 1, 'the live session should come from ctx.sessions')
+  assert.equal(first.json.usage.readFromDisk, 2)
+  assert.equal(
+    ctx.readCalls.includes('s-live'),
+    false,
+    `readSession was called for the live session: ${ctx.readCalls.join(', ')}`,
+  )
+  assert.deepEqual([...new Set(ctx.readCalls)].sort(), ['s-fork', 's-pro'])
+})
+check('both sources still produced the same totals', () => {
+  assert.equal(first.json.usage.scannedSessions, 3)
+  // s-live 4 from memory; s-fork 2 stored but only 1 after the inherited prefix is
+  // dropped; s-pro 1.
+  assert.equal(first.json.usage.scannedEvents, 4 + 1 + 1)
+})
+
+console.log('\n[15] the host caches the two expensive lookups')
+const cachedUsageAt = toppedUp.json.usage.generatedAt
+
+// These run sequentially and assert only on sync results: `fetchCalls` is a
+// shared counter, so overlapping async checks would race each other.
+const beforeCached = fetchCalls
+const cached = await invoke(ctx.routes[0])
+check('a repeat request reuses the cached balance and usage', () => {
+  assert.equal(cached.json.ok, true)
+  assert.equal(fetchCalls, beforeCached, 'the upstream balance API was called again')
+  assert.equal(cached.json.balance.balances[0].total, '10.00')
+  assert.equal(cached.json.usage.generatedAt, cachedUsageAt, 'the logs were rescanned')
+})
+
+const beforeForced = fetchCalls
+const forced = await invoke(ctx.routes[0], { url: `${mod.ROUTE}?fresh=1` })
+check('fresh=1 forces a real upstream call and a rescan', () => {
+  assert.equal(forced.json.ok, true)
+  assert.equal(fetchCalls, beforeForced + 1)
+  assert.ok(forced.json.usage.generatedAt >= cachedUsageAt)
+})
+
+const beforeConcurrent = fetchCalls
+const [left, right] = await Promise.all([
+  invoke(ctx.routes[0], { url: `${mod.ROUTE}?fresh=1` }),
+  invoke(ctx.routes[0], { url: `${mod.ROUTE}?fresh=1` }),
+])
+check('concurrent requests share one upstream call (single-flight)', () => {
+  assert.equal(left.json.ok, true)
+  assert.equal(right.json.ok, true)
+  assert.equal(fetchCalls, beforeConcurrent + 1, `expected 1 upstream call, saw ${fetchCalls - beforeConcurrent}`)
+})
+
 /* ============================== live pass ============================== */
 
 const liveKey = process.env.DSH_QUOTA_TEST_KEY
@@ -482,5 +579,6 @@ if (liveKey === undefined || liveKey === '') {
   }
 }
 
+await Promise.all(pending)
 console.log(failures === 0 ? '\nALL CHECKS PASSED' : `\n${failures} CHECK(S) FAILED`)
 process.exitCode = failures === 0 ? 0 : 1

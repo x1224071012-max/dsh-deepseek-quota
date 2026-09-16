@@ -1,6 +1,6 @@
 {
   "name": "@dsh-external/dsh-deepseek-quota",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "DeepSeek 额度：在会话视图标签栏新增「额度」页，展示账户剩余余额、当日 00:00 起的消费估算，以及今日／近 7 天按模型划分的 token 使用情况",
   "keywords": [
     "dsh",
