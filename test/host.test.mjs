@@ -15,7 +15,6 @@
  */
 
 import assert from 'node:assert/strict'
-import { existsSync } from 'node:fs'
 import { mkdtemp, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -615,13 +614,23 @@ check('...and the totals still match after the re-read', () => {
 
 console.log('\n[17] the extraction cache is persisted and reloaded')
 const cacheFile = join(home, 'dsh-deepseek-quota-cache.json')
-// Saving is fire-and-forget, so wait for the file rather than assuming it.
-for (let attempt = 0; attempt < 60 && !existsSync(cacheFile); attempt += 1) {
+// Saving is fire-and-forget, so poll until the newest state has landed rather
+// than assuming the first readable file is the current one.
+let persisted = null
+for (let attempt = 0; attempt < 120; attempt += 1) {
+  try {
+    const candidate = JSON.parse(await readFile(cacheFile, 'utf8'))
+    if (candidate?.sessions?.['s-pro']?.revision === 'rev-2') {
+      persisted = candidate
+      break
+    }
+  } catch {
+    // not written yet, or caught mid-rename
+  }
   await new Promise((resolve) => setTimeout(resolve, 25))
 }
-const persisted = existsSync(cacheFile) ? JSON.parse(await readFile(cacheFile, 'utf8')) : null
 check('the extraction cache was written to disk', () => {
-  assert.ok(persisted !== null, `no cache file at ${cacheFile}`)
+  assert.ok(persisted !== null, `no readable cache file at ${cacheFile}`)
   assert.equal(persisted.version, 1)
   assert.deepEqual(Object.keys(persisted.sessions).sort(), ['s-fork', 's-pro'])
   assert.equal(persisted.sessions['s-fork'].revision, 'rev-1')
