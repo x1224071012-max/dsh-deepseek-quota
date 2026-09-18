@@ -15,6 +15,7 @@
  */
 
 import assert from 'node:assert/strict'
+import { existsSync } from 'node:fs'
 import { mkdtemp, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -55,7 +56,7 @@ function check(label, fn) {
 }
 
 /** A minimal Cordis context exposing only what the host half reads. */
-function makeCtx({ sessions = [], logs = {}, credentials = {}, liveEvents = {} }) {
+function makeCtx({ sessions = [], logs = {}, credentials = {}, liveEvents = {}, revisions = {} }) {
   const routes = []
   const effects = []
   const readCalls = []
@@ -91,6 +92,17 @@ function makeCtx({ sessions = [], logs = {}, credentials = {}, liveEvents = {} }
             const events = liveEvents[String(id)]
             if (events === undefined) return undefined
             return { ownEvents: () => events }
+          },
+        }
+      }
+      if (serviceName === 'sessionPersistence') {
+        return {
+          /**
+           * Cheap change tokens, without loading any log. Read from the
+           * `revisions` object on every call, so a test can move one mid-run.
+           */
+          async listSnapshots() {
+            return Object.entries(revisions).map(([id, revision]) => ({ header: { id }, revision }))
           },
         }
       }
@@ -233,7 +245,9 @@ const logs = {
   },
 }
 
-const ctx = makeCtx({ sessions, logs, liveEvents, credentials: { DEEPSEEK_API_KEY: 'sk-test-key' } })
+/** Persistence revisions, mutable so a test can move one. */
+const revisions = { 's-fork': 'rev-1', 's-pro': 'rev-1' }
+const ctx = makeCtx({ sessions, logs, liveEvents, revisions, credentials: { DEEPSEEK_API_KEY: 'sk-test-key' } })
 mod.apply(ctx)
 
 console.log('\n[2] route registration')
@@ -242,8 +256,8 @@ check('one exact route at the documented path', () => {
   assert.equal(ctx.routes[0].kind, 'exact')
   assert.equal(ctx.routes[0].path, mod.ROUTE)
 })
-check('effect label recorded', () => {
-  assert.deepEqual(ctx.effects, ['deepseek-quota: quota route'])
+check('effect labels recorded', () => {
+  assert.deepEqual(ctx.effects, ['deepseek-quota: quota route', 'deepseek-quota: warmup guard'])
 })
 
 console.log('\n[3] guards')
@@ -554,6 +568,88 @@ check('concurrent requests share one upstream call (single-flight)', () => {
   assert.equal(left.json.ok, true)
   assert.equal(right.json.ok, true)
   assert.equal(fetchCalls, beforeConcurrent + 1, `expected 1 upstream call, saw ${fetchCalls - beforeConcurrent}`)
+})
+
+/* ============== persisted logs: parse once, reuse by revision ============== */
+
+console.log('\n[16] a persisted log is parsed once, then reused until its revision moves')
+check('the first scan read every persisted log', () => {
+  assert.equal(first.json.usage.revisionsAvailable, true)
+  assert.equal(first.json.usage.readFromDisk, 2)
+  assert.equal(first.json.usage.reusedExtractions, 0)
+})
+
+const beforeReuse = ctx.readCalls.length
+const reused = await invoke(ctx.routes[0], { url: `${mod.ROUTE}?fresh=1` })
+check('an unchanged log is served from the extraction cache', () => {
+  assert.equal(reused.json.ok, true)
+  assert.equal(reused.json.usage.readFromDisk, 0, 'a persisted log was read again')
+  assert.equal(reused.json.usage.reusedExtractions, 2)
+  assert.equal(reused.json.usage.readFromMemory, 1)
+  assert.equal(
+    ctx.readCalls.length,
+    beforeReuse,
+    `readSession ran again: ${ctx.readCalls.slice(beforeReuse).join(', ')}`,
+  )
+})
+check('reusing the cache does not change the numbers', () => {
+  assert.equal(reused.json.usage.today.requests, today.requests)
+  assert.equal(reused.json.usage.today.totalTokens, today.totalTokens)
+  assert.equal(reused.json.usage.today.cost, today.cost)
+})
+
+revisions['s-pro'] = 'rev-2'
+const moved = await invoke(ctx.routes[0], { url: `${mod.ROUTE}?fresh=1` })
+check('a moved revision re-reads only that one session', () => {
+  assert.equal(moved.json.usage.readFromDisk, 1)
+  assert.equal(moved.json.usage.reusedExtractions, 1)
+  assert.equal(ctx.readCalls[ctx.readCalls.length - 1], 's-pro')
+})
+check('...and the totals still match after the re-read', () => {
+  assert.equal(moved.json.usage.today.requests, today.requests)
+  assert.equal(moved.json.usage.today.totalTokens, today.totalTokens)
+  assert.equal(moved.json.usage.today.cost, today.cost)
+})
+
+/* ============== the extraction cache survives a restart ============== */
+
+console.log('\n[17] the extraction cache is persisted and reloaded')
+const cacheFile = join(home, 'dsh-deepseek-quota-cache.json')
+// Saving is fire-and-forget, so wait for the file rather than assuming it.
+for (let attempt = 0; attempt < 60 && !existsSync(cacheFile); attempt += 1) {
+  await new Promise((resolve) => setTimeout(resolve, 25))
+}
+const persisted = existsSync(cacheFile) ? JSON.parse(await readFile(cacheFile, 'utf8')) : null
+check('the extraction cache was written to disk', () => {
+  assert.ok(persisted !== null, `no cache file at ${cacheFile}`)
+  assert.equal(persisted.version, 1)
+  assert.deepEqual(Object.keys(persisted.sessions).sort(), ['s-fork', 's-pro'])
+  assert.equal(persisted.sessions['s-fork'].revision, 'rev-1')
+  assert.equal(persisted.sessions['s-pro'].revision, 'rev-2')
+})
+
+// A fresh instance with a cold in-memory cache, simulating a process restart.
+const restarted = makeCtx({
+  sessions,
+  logs,
+  liveEvents,
+  revisions,
+  credentials: { DEEPSEEK_API_KEY: 'sk-test-key' },
+})
+mod.apply(restarted)
+await new Promise((resolve) => setTimeout(resolve, 80))
+
+const warm = await invoke(restarted.routes[0], { url: `${mod.ROUTE}?fresh=1` })
+check('a fresh process serves persisted sessions from the disk cache', () => {
+  assert.equal(warm.json.ok, true)
+  assert.equal(warm.json.usage.readFromDisk, 0, 'a log was re-parsed despite a warm disk cache')
+  assert.equal(warm.json.usage.reusedExtractions, 2)
+  assert.equal(warm.json.usage.readFromMemory, 1)
+})
+check('...and reports the same numbers as a cold parse', () => {
+  assert.equal(warm.json.usage.today.requests, today.requests)
+  assert.equal(warm.json.usage.today.totalTokens, today.totalTokens)
+  assert.equal(warm.json.usage.today.cost, today.cost)
 })
 
 /* ============================== live pass ============================== */
